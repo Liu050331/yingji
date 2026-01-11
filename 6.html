@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>应急避难场所选址分析系统</title>
+
+  <!-- 高德地图 JS API v2.0 -->
+  <script src="https://webapi.amap.com/maps?v=2.0&key=8f7eebbf94925cd6fd5f61e457db7c4d"></script>
+
+  <!-- Chart.js -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body, #map { width: 100%; height: 100%; overflow: hidden; }
+    #controls {
+      position: absolute;
+      top: 20px;
+      right: 20px;
+      background: white;
+      padding: 15px;
+      border-radius: 8px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+      max-width: 320px;
+      z-index: 1000;
+      font-family: "Microsoft YaHei", sans-serif;
+      font-size: 14px;
+    }
+    #controls h3 {
+      margin-bottom: 10px;
+      font-size: 16px;
+    }
+    #controls label,
+    #controls button,
+    #controls select,
+    #controls p {
+      display: block;
+      margin: 8px 0;
+    }
+    #statsChartContainer {
+      margin-top: 15px;
+    }
+    canvas {
+      max-width: 100%;
+    }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+
+  <div id="controls">
+    <h3>应急避难场所选址分析系统</h3>
+    <label><input type="checkbox" id="geojsonToggle" checked /> 显示避难所+行政区</label><br>
+    <button id="locateBtn">📍 定位到我</button><br>
+    <label>周边搜索半径（米）：</label>
+    <select id="radiusSelect">
+      <option value="500">500</option>
+      <option value="1000" selected>1000</option>
+      <option value="2000">2000</option>
+    </select>
+    <p>👉 点击地图任意位置，搜索该点周边避难所</p>
+    <div id="statsChartContainer">
+      <canvas id="districtChart" height="200"></canvas>
+    </div>
+  </div>
+
+  <script>
+    // === 模拟避难所数据（点）===
+    const shelters = [
+      { name: "人民公园应急避难所", lng: 116.403, lat: 39.915, district: "东城区", capacity: 500 },
+      { name: "朝阳体育中心", lng: 116.485, lat: 39.922, district: "朝阳区", capacity: 1200 },
+      { name: "海淀实验中学操场", lng: 116.302, lat: 39.952, district: "海淀区", capacity: 800 },
+      { name: "丰台文化广场", lng: 116.282, lat: 39.852, district: "丰台区", capacity: 600 },
+      { name: "石景山市民应急中心", lng: 116.205, lat: 39.905, district: "石景山区", capacity: 700 },
+      { name: "西城防灾公园", lng: 116.352, lat: 39.912, district: "西城区", capacity: 900 },
+      { name: "通州运河广场", lng: 116.660, lat: 39.902, district: "通州区", capacity: 1000 }
+    ];
+
+    // === 模拟行政区边界（简化多边形）===
+    const districts = [
+      {
+        name: "东城区",
+        path: [
+          [116.39, 39.90], [116.42, 39.90], [116.42, 39.93], [116.39, 39.93], [116.39, 39.90]
+        ]
+      },
+      {
+        name: "朝阳区",
+        path: [
+          [116.45, 39.90], [116.50, 39.90], [116.50, 39.95], [116.45, 39.95], [116.45, 39.90]
+        ]
+      },
+      {
+        name: "海淀区",
+        path: [
+          [116.25, 39.93], [116.32, 39.93], [116.32, 39.98], [116.25, 39.98], [116.25, 39.93]
+        ]
+      }
+      // 可继续添加其他区
+    ];
+
+    let map;
+    let shelterMarkers = [];
+    let districtOverlays = [];
+
+    function initMap() {
+      map = new AMap.Map('map', {
+        zoom: 11,
+        center: [116.4, 39.9],
+        viewMode: '2D'
+      });
+
+      // ✅ 正确加载控件
+      map.plugin(['AMap.Scale', 'AMap.ToolBar'], function () {
+        map.addControl(new AMap.Scale({ visible: true }));
+        map.addControl(new AMap.ToolBar({ visible: true }));
+      });
+
+      // 加载 GeoJSON 数据（模拟）
+      loadGeoJSONLayers();
+
+      // 绑定点击事件
+      map.on('click', onMapClick);
+
+      // 渲染统计图
+      renderDistrictChart();
+
+      // 控件交互
+      document.getElementById('geojsonToggle').addEventListener('change', function () {
+        const show = this.checked;
+        shelterMarkers.forEach(m => m.setMap(show ? map : null));
+        districtOverlays.forEach(o => o.setMap(show ? map : null));
+      });
+
+      // 定位按钮
+      document.getElementById('locateBtn').addEventListener('click', function () {
+        if (!navigator.geolocation) {
+          alert('浏览器不支持定位');
+          return;
+        }
+        map.plugin('AMap.Geolocation', function () {
+          const geolocation = new AMap.Geolocation({ enableHighAccuracy: true, timeout: 10000 });
+          geolocation.getCurrentPosition((status, result) => {
+            if (status === 'complete') {
+              map.setCenter(result.position);
+              map.setZoom(14);
+            } else {
+              alert('定位失败，请检查权限。');
+            }
+          });
+        });
+      });
+    }
+
+    function loadGeoJSONLayers() {
+      // 添加避难所点
+      shelters.forEach(shelter => {
+        const marker = new AMap.Marker({
+          position: [shelter.lng, shelter.lat],
+          title: shelter.name,
+          map: map,
+          zIndex: 100
+        });
+        shelterMarkers.push(marker);
+      });
+
+      // 添加行政区面
+      districts.forEach(district => {
+        const polygon = new AMap.Polygon({
+          path: district.path,
+          strokeColor: "#FF33FF",
+          strokeWeight: 2,
+          fillColor: "#FFCCFF",
+          fillOpacity: 0.3,
+          map: map
+        });
+        districtOverlays.push(polygon);
+      });
+    }
+
+    function onMapClick(e) {
+      const radius = parseInt(document.getElementById('radiusSelect').value);
+      const clickPoint = e.lnglat;
+
+      // 移除旧圆圈
+      if (window.searchCircle) map.remove(window.searchCircle);
+      window.searchCircle = new AMap.Circle({
+        center: clickPoint,
+        radius: radius,
+        strokeColor: "#FF6600",
+        strokeOpacity: 0.8,
+        strokeWeight: 2,
+        fillColor: "#FFCC99",
+        fillOpacity: 0.3
+      });
+      window.searchCircle.setMap(map);
+
+      // 查找附近避难所
+      const nearby = shelters.filter(s => {
+        const dist = AMap.GeometryUtil.distance(clickPoint, [s.lng, s.lat]);
+        return dist <= radius;
+      });
+
+      let content = `<b>📍 ${radius}米范围内找到 ${nearby.length} 个避难所：</b><br>`;
+      if (nearby.length === 0) {
+        content += "⚠️ 该区域暂无应急避难场所";
+      } else {
+        nearby.forEach(s => {
+          content += `• ${s.name}（${s.district}，容量：${s.capacity}人）<br>`;
+        });
+      }
+
+      new AMap.InfoWindow({ content, offset: new AMap.Pixel(0, -10) }).open(map, clickPoint);
+    }
+
+    function renderDistrictChart() {
+      const districtCount = {};
+      shelters.forEach(s => {
+        districtCount[s.district] = (districtCount[s.district] || 0) + 1;
+      });
+
+      const ctx = document.getElementById('districtChart').getContext('2d');
+      new Chart(ctx, {
+        type: 'bar',
+        data: {
+          labels: Object.keys(districtCount),
+          datasets: [{
+            label: '避难所数量',
+            data: Object.values(districtCount),
+            backgroundColor: 'rgba(54, 162, 235, 0.6)',
+            borderColor: 'rgba(54, 162, 235, 1)',
+            borderWidth: 1
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: { legend: { display: false } },
+          scales: { y: { beginAtZero: true, ticks: { stepSize: 1 } } }
+        }
+      });
+    }
+
+    window.addEventListener('load', initMap);
+  </script>
+</body>
+</html>
